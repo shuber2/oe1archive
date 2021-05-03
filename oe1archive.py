@@ -2,7 +2,7 @@
 
 """A simple tool to query the Oe1 7 Tage archive."""
 
-__version__ = "2.0"
+__version__ = "2.1"
 __author__ = "Stefan Huber"
 
 
@@ -54,7 +54,7 @@ class Archive:
             return None
 
         sid = sjson[0]['loopStreamId']
-        surl = 'http://loopstream01.apa.at/?channel=oe1&shoutcast=0&id=%s'
+        surl = 'https://loopstream01.apa.at/?channel=oe1&shoutcast=0&id=%s'
         return surl % sid
 
     def get_broadcast_description(self, day, broadcast):
@@ -172,7 +172,7 @@ def get_directory_name(name, datetime):
     if len(name) > 0:
         prefix = name + "_"
 
-    return prefix + datetime.strftime("%Y-%m-%d")
+    return prefix + datetime.strftime("%d-%m-%Y")
 
 def make_directory(name, datetime):
     """Creates the download subdirectory for the given name and datetime."""
@@ -184,7 +184,7 @@ def write_html_file(name, datetime, description):
     """Stores broadcast description into a html file."""
 
     longname = get_directory_name(name, datetime)
-    filepath = os.path.join(longname, "description.html")
+    filepath = os.path.join(longname, longname + ".html")
     file = open(filepath, 'w+')
     file.write("<!DOCTYPE html>\n")
     file.write("<html>\n")
@@ -205,7 +205,7 @@ def write_mp3_file(name, datetime, url):
     import requests
 
     longname = get_directory_name(name, datetime)
-    filepath = os.path.join(longname, "stream.mp3")
+    filepath = os.path.join(longname, longname + ".mp3")
 
     print("Fetching mp3...")
     r = requests.get(url, stream=True)
