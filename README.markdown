@@ -1,4 +1,4 @@
-# oe1archive.py
+# oe1archive
 
 A tool do download Ö1 radio broadcasts. This repo is a clone of this [original
 repo](https://git.sthu.org/?p=oe1archive.git) and there is also a
@@ -6,13 +6,13 @@ repo](https://git.sthu.org/?p=oe1archive.git) and there is also a
 
 To search or fetch broadcasts with oe1archive, call it like this:
 
-    % oe1archive.py -h
+    % ./oe1archive -h
     Usage:
-        ./oe1archive.py -h, --help
-        ./oe1archive.py -c, --choose
-        ./oe1archive.py -s, --search TITLE
+        ./oe1archive -h, --help
+        ./oe1archive -c, --choose
+        ./oe1archive -s, --search TITLE
 
-    % oe1archive.py -s jazz
+    % ./oe1archive -s jazz
 
 
 ## Contributors
