@@ -1,9 +1,57 @@
 #!/usr/bin/env python3
 
-"""A simple tool to query the Oe1 7 Tage archive."""
+"""A tool to query the OE1 30-day archive and download streams with HTML pages.
 
-__version__ = "2.1"
-__author__ = "Stefan Huber"
+FEATURES:
+- Browse all 30 days in interactive mode
+- Recent week (API window): Direct show selection and download
+- Older 22+ days (archive): Search for specific shows, then download
+- Automatic loopstream ID extraction (no manual URL searching)
+- Batch download of matching shows with HTML metadata
+- Proper file organization with timestamped folders
+- Fast search on title and subtitle, optional extended search with descriptions
+
+HOW IT WORKS:
+The OE1 API provides a rolling weekly broadcast listing. Shows are accessible via
+loopstream IDs for approximately 30 days. This tool combines:
+
+1. INTERACTIVE MODE (-c):
+   - Shows all 30 days of dates
+   - Recent week: Select from full broadcast list
+   - Older dates: Directs you to search for specific shows
+
+2. SEARCH MODE (-s):
+   - Searches all available broadcasts across the 30-day window
+   - Matches against title and subtitle (fast)
+   - Returns matching shows that can be downloaded
+
+3. EXTENDED SEARCH MODE (-s -e):
+   - Searches title, subtitle, AND description (slower, ~5 minutes)
+   - Use when regular search doesn't find what you're looking for
+   - Returns matching shows that can be downloaded
+
+4. BATCH DOWNLOAD (-d + -p):
+   - Automatically downloads all matching broadcasts
+   - Creates organized folders with HTML metadata
+   - Use -e flag for extended search matching
+
+ACCESSING OLDER SHOWS:
+For dates older than 8 days, use search by show name:
+   ./oe1archive -s "Show Name"
+
+You can also manually browse: https://oe1.orf.at/programm/YYYYMMDD
+Then search for the show by name in this tool.
+
+USAGE EXAMPLES:
+  ./oe1archive -c                     # Browse and select
+  ./oe1archive -s "Some title"            # Search by title/subtitle (fast)
+  ./oe1archive -s "Some description" -e         # Extended search with description (slow)
+  ./oe1archive -d "Some title" -p "L"     # Download all matches
+  ./oe1archive -d "Some description" -p "L" -e  # Download with extended search
+"""
+
+__version__ = "3.0"
+__author__ = "Stefan Huber, Gerhard Mitterlechner"
 
 
 import urllib.request
@@ -13,238 +61,626 @@ import sys
 import getopt
 import re
 import os
+import requests
+from datetime import datetime, timedelta
+import time
 
 
-class Archive:
+class SuperArchive:
+    """Access OE1 archive with extended 30-day capability.
 
-    def __init__(self):
-        self.json = read_json("http://audioapi.orf.at/oe1/json/2.0/broadcasts/")
+    The OE1 API provides a rolling weekly window of broadcasts. However, loopstream IDs
+    remain valid for approximately 30 days. This tool simulates a 30-day view by:
+    1. Fetching the current weekly API data
+    2. Creating placeholder entries for dates before the API window (up to 30 days back)
+    3. Allowing searches across all dates - when found, the actual broadcast data is used
+    """
+
+    def __init__(self, days=30):
+        """Initialize archive with configurable day range (default 30 days)."""
+        self.days_back = days
+        self.api_json = self._read_archive()
+        self.json = self._generate_30day_view()
+
+    def _read_archive(self):
+        """Read the current weekly archive from the API."""
+        try:
+            json_data = read_json(
+                "http://audioapi.orf.at/oe1/json/2.0/broadcasts/")
+            print(
+                f"Loaded {len(json_data)} days from OE1 API",
+                file=sys.stderr)
+            return json_data
+        except Exception as e:
+            print(f"Error fetching broadcasts: {e}", file=sys.stderr)
+            return []
+
+    def _generate_30day_view(self):
+        """Generate a 30-day view by fetching data from the API.
+
+        Uses the path parameter API endpoint (/broadcasts/YYYYMMDD/) to fetch
+        all broadcasts for each day, extending beyond the standard weekly window.
+        """
+        extended_json = []
+
+        if not self.api_json:
+            return extended_json
+
+        # Add all API data
+        extended_json.extend(self.api_json)
+
+        # For dates older than the API window, fetch via path parameter API
+        if len(self.api_json) > 0:
+            try:
+                oldest_api_date = dateutil.parser.parse(
+                    self.api_json[-1].get('dateISO', ''))
+                print(
+                    f"Loading extended archive data (this may take a moment)...",
+                    file=sys.stderr)
+
+                # Fetch broadcasts for dates older than the API window
+                # Start from len(self.api_json) to avoid re-fetching dates
+                # already in api_json
+                for days_offset in range(
+                        len(self.api_json), self.days_back + 1):
+                    archive_date = oldest_api_date - \
+                        timedelta(days=days_offset)
+                    date_int = int(archive_date.strftime('%Y%m%d'))
+
+                    try:
+                        # Use path parameter API to get broadcasts for specific
+                        # date
+                        api_url = f"http://audioapi.orf.at/oe1/json/2.0/broadcasts/{date_int}/"
+                        broadcasts_data = read_json(api_url)
+
+                        if broadcasts_data:
+                            # Create entry for this date with fetched
+                            # broadcasts
+                            archive_entry = {
+                                'dateISO': archive_date.isoformat(),
+                                'day': date_int,
+                                'broadcasts': broadcasts_data
+                            }
+                            extended_json.append(archive_entry)
+                            print(
+                                f"  Loaded {archive_date.strftime('%a %d.%b')}: {len(broadcasts_data)} broadcasts",
+                                file=sys.stderr)
+                        else:
+                            # Fallback to guide entry if fetch fails
+                            guide_entry = {
+                                'dateISO': archive_date.isoformat(),
+                                'day': date_int,
+                                'broadcasts': [{
+                                    'title': f'[Archive Guide: {archive_date.strftime("%a, %d. %b %Y")}]',
+                                    'subtitle': 'Use -s to search for shows from this date',
+                                    'startISO': archive_date.isoformat(),
+                                    'programKey': f'archive_{date_int}',
+                                    'is_guide': True
+                                }]
+                            }
+                            extended_json.append(guide_entry)
+                    except Exception as e:
+                        # If individual date fetch fails, create guide entry
+                        guide_entry = {
+                            'dateISO': archive_date.isoformat(),
+                            'day': date_int,
+                            'broadcasts': [{
+                                'title': f'[Archive Guide: {archive_date.strftime("%a, %d. %b %Y")}]',
+                                'subtitle': 'Use -s to search for shows from this date',
+                                'startISO': archive_date.isoformat(),
+                                'programKey': f'archive_{date_int}',
+                                'is_guide': True
+                            }]
+                        }
+                        extended_json.append(guide_entry)
+
+                    # Small delay to avoid overwhelming the API
+                    time.sleep(0.1)
+
+                print(
+                    f"Archive data loaded: {len(extended_json)} days total",
+                    file=sys.stderr)
+            except Exception as e:
+                print(
+                    f"Note: Could not extend to 30 days: {e}",
+                    file=sys.stderr)
+
+        return extended_json
 
     def get_days(self):
-        return map(_json_to_day, self.json)
+        """Return list of available days."""
+        return list(map(_json_to_day, self.json))
 
     def get_broadcasts(self, day):
-        bjson = self.json[day]['broadcasts']
-        return map(_json_to_broadcast, bjson)
+        """Return broadcasts for a given day index."""
+        if day < 0 or day >= len(self.json):
+            return []
+        bjson = self.json[day].get('broadcasts', [])
+        # Don't filter - return all entries including guides
+        return list(map(_json_to_broadcast, bjson))
 
     def get_broadcast(self, day, broadcast):
-        return _json_to_broadcast(self.json[day]['broadcasts'][broadcast])
+        """Return specific broadcast information."""
+        if day < 0 or day >= len(self.json) or broadcast < 0:
+            return (None, None)
+        broadcasts = self.json[day].get('broadcasts', [])
+        if broadcast >= len(broadcasts):
+            return (None, None)
+        return _json_to_broadcast(broadcasts[broadcast])
 
     def get_player_url(self, day, broadcast):
+        """Get the player URL for a broadcast."""
         date = self.json[day]['day']
         pk = self.json[day]['broadcasts'][broadcast]['programKey']
         url = "http://oe1.orf.at/player/%d/%s"
         return url % (date, pk)
 
+    def get_broadcast_title(self, day, broadcast):
+        """Return broadcast title."""
+        return self.json[day]['broadcasts'][broadcast]['title']
+
     def get_broadcast_subtitle(self, day, broadcast):
+        """Return broadcast subtitle."""
         return self.json[day]['broadcasts'][broadcast]['subtitle']
 
     def get_broadcast_pk(self, day, broadcast):
+        """Return broadcast program key."""
         return self.json[day]['broadcasts'][broadcast]['programKey']
 
     def get_broadcast_url(self, day, broadcast):
+        """Get the stream URL for a broadcast.
+
+        Handles both API broadcasts and archive shows from program pages.
+        """
+        broadcast_entry = self.json[day]['broadcasts'][broadcast]
         date = self.json[day]['day']
-        pk = self.json[day]['broadcasts'][broadcast]['programKey']
+        pk = broadcast_entry['programKey']
 
         burl = 'https://audioapi.orf.at/oe1/api/json/current/broadcast/%s/%d'
-        bjson = read_json(burl % (pk, date))
+        try:
+            bjson = read_json(burl % (pk, date))
+        except Exception as e:
+            print(
+                f"Warning: Could not fetch broadcast details: {e}",
+                file=sys.stderr)
+            return None
 
-        sjson = bjson['streams']
+        sjson = bjson.get('streams', [])
         if len(sjson) == 0:
             return None
 
-        sid = sjson[0]['loopStreamId']
+        sid = sjson[0].get('loopStreamId')
+        if sid is None:
+            return None
+
         surl = 'https://loopstream01.apa.at/?channel=oe1&shoutcast=0&id=%s'
         return surl % sid
 
     def get_broadcast_description(self, day, broadcast):
+        """Get broadcast description and akm info."""
         date = self.json[day]['day']
         pk = self.json[day]['broadcasts'][broadcast]['programKey']
 
         burl = 'https://audioapi.orf.at/oe1/api/json/current/broadcast/%s/%d'
-        bjson = read_json(burl % (pk, date))
+        try:
+            bjson = read_json(burl % (pk, date))
+        except Exception as e:
+            return ""
 
-        description = bjson['description']
-        akm = bjson['akm']
+        description = bjson.get('description', "")
+        akm = bjson.get('akm', "")
         if description is None:
             description = ""
         if akm is None:
             akm = ""
-        return description + "<br>" + akm;
+        return description + "<br>" + akm
 
-    def get_broadcasts_by_regex(self, key):
+    def get_broadcasts_by_regex(self, key, deep_search=False):
+        """Find broadcasts matching a regex pattern.
+
+        Args:
+            key: Search pattern (regex)
+            deep_search: If True, search in title, subtitle, and description.
+                        If False, search only in title and subtitle (faster).
+
+        Skips placeholder entries.
+        """
         rex = re.compile(key, re.IGNORECASE)
 
         res = []
+        total_broadcasts = sum(len(djson['broadcasts']) for djson in self.json)
+        checked_broadcasts = 0
+
         for d, djson in enumerate(self.json):
             for b, bjson in enumerate(djson['broadcasts']):
+                checked_broadcasts += 1
+
+                # Show progress every 10 broadcasts
+                if checked_broadcasts % 10 == 0:
+                    print(
+                        f"Searching... {checked_broadcasts}/{total_broadcasts} broadcasts checked",
+                        file=sys.stderr)
+
+                # Skip placeholder entries in search
+                if bjson.get('is_placeholder', False):
+                    continue
+
+                found = False
+
+                # Search in title
                 if rex.search(bjson['title']) is not None:
+                    found = True
+
+                # Search in subtitle
+                if not found:
+                    subtitle = bjson.get('subtitle')
+                    if subtitle is not None and rex.search(
+                            subtitle) is not None:
+                        found = True
+
+                # Search in description (only if deep_search is enabled)
+                if not found and deep_search:
+                    try:
+                        date = djson['day']
+                        pk = bjson['programKey']
+                        burl = 'https://audioapi.orf.at/oe1/api/json/current/broadcast/%s/%d'
+                        bjson_full = read_json(burl % (pk, date))
+                        description = bjson_full.get('description', "")
+                        if description and rex.search(description) is not None:
+                            found = True
+                    except BaseException:
+                        pass
+
+                if found:
                     res.append((d, b))
-                elif bjson['subtitle'] is not None and rex.search(bjson['subtitle']) is not None:
-                    res.append((d, b))
+
+        print(f"Search complete: {len(res)} result(s) found", file=sys.stderr)
         return res
 
+    def download_broadcast(self, day, broadcast, prefix):
+        """Download a single broadcast with HTML and MP3."""
+        try:
+            date, title = self.get_broadcast(day, broadcast)
+
+            # Skip placeholder entries
+            if date is None or 'Archive' in title:
+                print(
+                    f"  ✗ This is a placeholder entry. Use search (-s) to find shows from this date.")
+                return False
+
+            url = self.get_broadcast_url(day, broadcast)
+
+            if url is None:
+                print(f"  ✗ No stream available for: {title}")
+                return False
+
+            dirname = get_directory_name(prefix, date)
+            print(f"  ↓ {title}")
+
+            # Create directory and download files
+            make_directory(prefix, date)
+
+            description = self.get_broadcast_description(day, broadcast)
+            write_html_file(prefix, date, title, description)
+            write_mp3_file(prefix, date, url)
+
+            return True
+
+        except Exception as e:
+            print(f"  ✗ Error downloading: {e}")
+            return False
+
+
 def _json_to_day(djson):
+    """Convert JSON date to datetime object."""
     return dateutil.parser.parse(djson['dateISO'])
 
+
 def _json_to_broadcast(bjson):
+    """Convert JSON broadcast to (datetime, title) tuple."""
     dt = dateutil.parser.parse(bjson['startISO'])
     return (dt, bjson['title'])
 
 
 def read_json(url):
+    """Read JSON from URL."""
     with urllib.request.urlopen(url) as f:
         dec = simplejson.JSONDecoder()
         return dec.decode(f.read())
 
+
 def input_index(prompt, li):
+    """Get valid index from user input."""
     while True:
         try:
             idx = int(input(prompt))
             if idx < 0 or idx >= len(li):
-                print("Out out range!")
+                print("Out of range!")
             else:
                 return idx
-
         except ValueError:
             print("Unknown input.")
         except EOFError:
             sys.exit(1)
 
+
+def get_directory_name(name, datetime_obj):
+    """Create directory name from prefix and datetime."""
+    prefix = ""
+    if len(name) > 0:
+        prefix = name + "_"
+
+    return prefix + datetime_obj.strftime("%Y%m%d_%H%M")
+
+
+def make_directory(name, datetime_obj):
+    """Create the download subdirectory for the given name and datetime."""
+    dirname = get_directory_name(name, datetime_obj)
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def write_html_file(name, datetime_obj, title, description):
+    """Store broadcast description and title into an HTML file."""
+    longname = get_directory_name(name, datetime_obj)
+    filepath = os.path.join(longname, longname + ".html")
+
+    with open(filepath, 'w+', encoding='utf-8') as file:
+        file.write("<!DOCTYPE html>\n")
+        file.write("<html>\n")
+        file.write("<head>\n")
+        file.write("<title>\n")
+        file.write(
+            "%s - %s\n" %
+            (title, datetime_obj.strftime("%d.%m.%Y %H:%M")))
+        file.write("</title>\n")
+        file.write("<meta charset=\"utf-8\">\n")
+        file.write("</head>\n")
+        file.write("<body>\n")
+        file.write("<h1>%s</h1>\n" % title)
+        file.write("<p><strong>Date/Time:</strong> %s</p>\n" %
+                   datetime_obj.strftime("%d.%m.%Y %H:%M:%S"))
+        if name:
+            file.write("<p><strong>Show:</strong> %s</p>\n" % name)
+        file.write("<hr>\n")
+        file.write(description)
+        file.write("\n</body>\n")
+        file.write("</html>")
+
+
+def write_mp3_file(name, datetime_obj, url):
+    """Download and save MP3 file from URL."""
+    longname = get_directory_name(name, datetime_obj)
+    filepath = os.path.join(longname, longname + ".mp3")
+
+    print(f"      Downloading MP3...")
+    try:
+        # Use generous timeout (3600 seconds = 60 minutes) for very large MP3
+        # files
+        r = requests.get(url, stream=True, timeout=3600)
+        if r.status_code == 200:
+            total_size = int(r.headers.get('content-length', 0))
+            downloaded = 0
+
+            with open(filepath, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size:
+                            percent = (downloaded / total_size) * 100
+                            print(f"      Progress: {percent:.1f}%", end='\r')
+
+            print(f"      ✓ Saved: {os.path.basename(filepath)}    ")
+        else:
+            print(f"      ✗ Error: HTTP {r.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"      ✗ Download failed: {e}")
+
+
 def screen_help():
-    print("""Usage:
-    {0} -h, --help
-    {0} -c, --choose
-    {0} -s, --search TITLE""".format(sys.argv[0]))
+    """Display help information."""
+    print("""OE1 Archive - Extended 30-day downloader
 
-def screen_choose():
-    a = Archive()
+Usage:
+    {0} -h, --help              Show this help message
+    {0} -c, --choose            Interactive mode - choose and download
+    {0} -s, --search TITLE      Search by title and subtitle (fast, ~10 seconds)
+    {0} -s TITLE -e             Extended search including description (slow, ~5 minutes)
+    {0} -d, --download TITLE    Auto-download all matching broadcasts
+                                 (requires directory prefix via -p)
+    {0} -p, --prefix PREFIX     Directory prefix for downloads
+    {0} -e, --extended-search   Extended search (use with -s or -d)
 
+Examples:
+    {0} -c                      Choose broadcast interactively
+    {0} -s "Music"              Search title/subtitle for "Music" (fast)
+    {0} -s "Music" -e           Extended search including description (slow)
+    {0} -d "Brunch" -p "Brunch" Download all "Brunch" broadcasts
+    {0} -d "Brunch" -p "B" -e   Download using extended search
+""".format(sys.argv[0]))
+
+
+def screen_choose(archive):
+    """Interactive mode to select and download broadcasts."""
     print("Choose a date:")
-    days = list(a.get_days())
+    days = archive.get_days()
     for i, date in enumerate(days):
-        print("  [%d]  %s" % (i, date.strftime("%a %d. %b %Y")))
+        broadcasts_count = len(archive.get_broadcasts(i))
+        if broadcasts_count == 0:
+            marker = "  (No shows available)"
+        elif broadcasts_count == 1:
+            # Check if it's a guide entry
+            b = archive.get_broadcasts(i)[0]
+            if b[1].startswith('[Archive Guide'):
+                marker = "  🔍 Use search for this date"
+            else:
+                marker = f"  ({broadcasts_count} broadcast)"
+        else:
+            marker = f"  ({broadcasts_count} broadcasts)"
+        print("  [%d]  %s%s" % (i, date.strftime("%a %d. %b %Y"), marker))
     day = input_index("Date: ", days)
     chosen_datetime = days[day]
     print()
 
+    broadcasts = archive.get_broadcasts(day)
+
+    # Check if this is a guide entry
+    if broadcasts and len(broadcasts) == 1:
+        title, _ = broadcasts[0]
+        if title and title.startswith('[Archive Guide'):
+            print(f"{title}")
+            print()
+            print("This date is in the archive window (older than 8 days).")
+            print("To download shows from this date, search by show name:")
+            print()
+            print("  ./oe1archive -s \"Show Name\"")
+            print("  ./oe1archive -d \"Show Name\" -p \"prefix\"")
+            print()
+            answer = input("Would you like to search for a show? (y/N) ")
+            if answer in ["y", "Y", "j", "J"]:
+                search_term = input("Enter show name to search for: ")
+                print()
+                screen_search(archive, search_term)
+            return
+
+    # Check if date has actual broadcasts
+    if not broadcasts:
+        print(
+            f"No broadcasts available for {chosen_datetime.strftime('%A, %d. %B %Y')}.")
+        return
+
     print("Choose a broadcast:")
-    broadcasts = list(a.get_broadcasts(day))
     for i, b in enumerate(broadcasts):
         date, title = b
         print("  [%2d]  %s  %s" % (i, date.strftime("%H:%M:%S"), title))
     broadcast = input_index("Broadcast: ", broadcasts)
     print()
 
-    print_broadcast_info(a, day, broadcast)
+    print_broadcast_info(archive, day, broadcast)
     print()
 
-    url = a.get_broadcast_url(day, broadcast)
+    url = archive.get_broadcast_url(day, broadcast)
     if url is not None:
-        answer = input("Do you want to download the chosen broadcast? (y/N) ")
+        answer = input("Do you want to download this broadcast? (y/N) ")
         if answer in ["y", "Y", "j", "J"]:
-            name = input("Download directory (prefix): ")
-
-            try:
-                dirname = get_directory_name(name, chosen_datetime)
-                print("Downloading to %s..." % dirname)
-
-                make_directory(name, chosen_datetime)
-
-                description = a.get_broadcast_description(day, broadcast)
-                write_html_file(name, chosen_datetime, description)
-
-                write_mp3_file(name, chosen_datetime, url)
-
-            except OSError as e:
-                print("Error creating directory.")
-                print(e)
-
-            except requests.exceptions.RequestException as e:
-                print("Request getting mp3 failed.")
-
-            except Exception as e:
-                print("Error downloading mp3.")
-                print(e)
-
-def get_directory_name(name, datetime):
-    prefix = ""
-    if len(name) > 0:
-        prefix = name + "_"
-
-    return prefix + datetime.strftime("%d-%m-%Y")
-
-def make_directory(name, datetime):
-    """Creates the download subdirectory for the given name and datetime."""
-    dirname = get_directory_name(name, datetime)
-    if not os.path.exists(dirname):
-        os.makedirs(dirname)
-
-def write_html_file(name, datetime, description):
-    """Stores broadcast description into a html file."""
-
-    longname = get_directory_name(name, datetime)
-    filepath = os.path.join(longname, longname + ".html")
-    file = open(filepath, 'w+')
-    file.write("<!DOCTYPE html>\n")
-    file.write("<html>\n")
-    file.write("<head>\n")
-    file.write("<title>\n")
-    file.write("%s %s\n" % (name, datetime.strftime("%d.%m.%Y")))
-    file.write("</title>\n")
-    file.write("<meta charset = \"utf-8\">\n")
-    file.write("</head>\n")
-    file.write("<body>\n")
-    file.write("%s %s" % (name, datetime.strftime("%d.%m.%Y")))
-    file.write(description)
-    file.write("</body>\n")
-    file.write("</html>")
-    file.close()
-
-def write_mp3_file(name, datetime, url):
-    import requests
-
-    longname = get_directory_name(name, datetime)
-    filepath = os.path.join(longname, longname + ".mp3")
-
-    print("Fetching mp3...")
-    r = requests.get(url, stream=True)
-    if r.status_code == 200:
-        with open(filepath, 'wb') as f:
-            f.write(r.content)
+            prefix = input("Directory prefix (optional): ")
+            archive.download_broadcast(day, broadcast, prefix)
+            print("\nDownload completed!")
     else:
-        print("Error downloading mp3. Status code: %d" % r.status_code)
+        print("No stream available for this broadcast.")
 
-def screen_search(key):
-    a = Archive()
-    for d, b in a.get_broadcasts_by_regex(key):
-        print_broadcast_info(a, d, b)
+
+def screen_search(archive, key, deep_search=False):
+    """Search for broadcasts matching a pattern.
+
+    Args:
+        archive: SuperArchive instance
+        key: Search pattern
+        deep_search: If True, search in description as well (slower)
+    """
+    results = archive.get_broadcasts_by_regex(key, deep_search=deep_search)
+    if not results:
+        print(f"No broadcasts found matching: {key}")
+        return
+
+    print(f"Found {len(results)} broadcast(s):\n")
+    for d, b in results:
+        print_broadcast_info(archive, d, b)
         print()
 
+
+def screen_download_all(archive, search_key, prefix, deep_search=False):
+    """Automatically download all broadcasts matching a search pattern.
+
+    Args:
+        archive: SuperArchive instance
+        search_key: Search pattern
+        prefix: Directory prefix for downloads
+        deep_search: If True, search in description as well (slower)
+    """
+    results = archive.get_broadcasts_by_regex(
+        search_key, deep_search=deep_search)
+    if not results:
+        print(f"No broadcasts found matching: {search_key}")
+        return
+
+    print(f"Found {len(results)} broadcast(s) to download.\n")
+    print("Starting downloads...\n")
+
+    success_count = 0
+    for d, b in results:
+        date, title = archive.get_broadcast(d, b)
+        print(f"{date.strftime('%a %d.%m.%Y %H:%M:%S')} - {title}")
+
+        if archive.download_broadcast(d, b, prefix):
+            success_count += 1
+        print()
+
+    print(f"\nDownload completed: {success_count}/{len(results)} successful")
+
+
 def print_broadcast_info(archive, day, broadcast):
-    a, d, b = archive, day, broadcast
-    date, title = a.get_broadcast(d, b)
+    """Print detailed information about a broadcast."""
+    date, title = archive.get_broadcast(day, broadcast)
 
     print("%s   %s" % (date.strftime("%a %d.%m.%Y  %H:%M:%S"), title))
-    print("  %s" % a.get_broadcast_subtitle(d, b))
-    print("  Broadcast: %s" % a.get_broadcast_url(d, b))
-    print("  Player: %s" % a.get_player_url(d, b))
-    print("  Program key: %s" % a.get_broadcast_pk(d, b))
+    print("  %s" % archive.get_broadcast_subtitle(day, broadcast))
+    url = archive.get_broadcast_url(day, broadcast)
+    print("  Stream: %s" % (url if url else "Not available"))
+    print("  Player: %s" % archive.get_player_url(day, broadcast))
+    print("  Program key: %s" % archive.get_broadcast_pk(day, broadcast))
+
 
 if __name__ == "__main__":
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hcs:",
-                ["help", "choose", "search="])
+        opts, args = getopt.getopt(sys.argv[1:], "hcs:p:d:e", [
+                                   "help", "choose", "search=", "prefix=", "download=", "extended-search"])
     except getopt.GetoptError as err:
         print(err)
         screen_help()
         sys.exit(2)
 
+    archive = None
+    search_key = None
+    download_key = None
+    prefix = ""
+    choose_mode = False
+    extended_search = False
+
     for o, a in opts:
         if o in ["-h", "--help"]:
             screen_help()
+            sys.exit(0)
         if o in ["-c", "--choose"]:
-            screen_choose()
+            choose_mode = True
         if o in ["-s", "--search"]:
-            screen_search(a)
+            search_key = a
+        if o in ["-d", "--download"]:
+            download_key = a
+        if o in ["-p", "--prefix"]:
+            prefix = a
+        if o in ["-e", "--extended-search"]:
+            extended_search = True
+
+    # Initialize archive
+    archive = SuperArchive(days=30)
+
+    # Execute requested action
+    if choose_mode:
+        screen_choose(archive)
+    elif download_key:
+        if not prefix:
+            print("Error: --prefix required when using --download")
+            print("Example: oe1archive.py -d 'Brunch' -p 'Brunch'")
+            sys.exit(1)
+        screen_download_all(
+            archive,
+            download_key,
+            prefix,
+            deep_search=extended_search)
+    elif search_key:
+        screen_search(archive, search_key, deep_search=extended_search)
+    else:
+        screen_help()
